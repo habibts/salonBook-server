@@ -6,6 +6,7 @@ import { MongoClient } from 'mongodb';
 const port = process.env.PORT || 3001;
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-bqzlc8s-shard-00-00.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-01.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-02.6my06uv.mongodb.net:27017/?ssl=true&replicaSet=atlas-14p3me-shard-0&authSource=admin`)
 
@@ -23,6 +24,43 @@ const connectedClient = await connectToMongoDB();
 const db = connectedClient.db('salonBook');
 const usersCollection = db.collection('user');
 const servicesCollection = db.collection('services');
+const appointmentsCollection = db.collection('appointments');
+
+app.post('/appointments', express.json(), async (req, res) => {
+  try {
+    const { customerId, customerName, customerEmail, serviceId, appointmentDate, timeSlot, message } = req.body;
+    const service = await servicesCollection.findOne({ _id: new (await import('mongodb')).ObjectId(serviceId) });
+    if (!service || service.status !== 'active') return res.status(400).send('Invalid service');
+    const exists = await appointmentsCollection.findOne({ serviceId, appointmentDate, timeSlot, status: { $ne: 'cancelled' } });
+    if (exists) return res.status(409).send('Slot unavailable');
+    const appointment = {
+      customerId, customerName, customerEmail, serviceId,
+      serviceName: service.serviceName,
+      serviceImage: service.image,
+      appointmentDate, timeSlot,
+      price: service.price,
+      duration: service.duration,
+      message: message || '',
+      status: 'Pending',
+      paymentStatus: 'Unpaid',
+      createdAt: new Date().toISOString(),
+    };
+    await appointmentsCollection.insertOne(appointment);
+    res.json(appointment);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error creating appointment');
+  }
+});
+
+app.get('/appointments', async (req, res) => {
+  try {
+    const appointments = await appointmentsCollection.find().toArray();
+    res.json(appointments);
+  } catch (err) {
+    res.status(500).send('Error retrieving appointments');
+  }
+});
 
 app.get('/users', async (req, res) => {
   try {
@@ -46,6 +84,20 @@ app.get('/services', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.send('Hello World!');
+});
+
+app.patch('/appointments/:id/cancel', async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    const result = await appointmentsCollection.updateOne(
+      { _id: new ObjectId(req.params.id), status: 'Pending' },
+      { $set: { status: 'Cancelled', updatedAt: new Date().toISOString() } }
+    );
+    if (result.matchedCount === 0) return res.status(400).send('Cannot cancel');
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).send('Error cancelling appointment');
+  }
 });
 
 app.listen(port, () => {
