@@ -22,6 +22,7 @@ export async function connectToMongoDB() {
 const connectedClient = await connectToMongoDB();
 const db = connectedClient.db('salonBook');
 const usersCollection = db.collection('user');
+const servicesCollection = db.collection('services');
 
 app.get('/users', async (req, res) => {
   try {
@@ -33,6 +34,15 @@ app.get('/users', async (req, res) => {
   }
 });
 
+app.get('/services', async (req, res) => {
+  try {
+    const services = await servicesCollection.find().toArray();
+    res.json(services);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error retrieving services');
+  }
+});
 
 app.get('/', (req, res) => {
   res.send('Hello World!');
