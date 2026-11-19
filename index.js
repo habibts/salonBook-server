@@ -179,6 +179,27 @@ app.patch('/services/:id', express.json(), async (req, res) => {
   }
 });
 
+app.patch('/users/:id/status', express.json(), async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    const { status } = req.body;
+    await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).send('Error updating user status');
+  }
+});
+
+app.delete('/users/:id', async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    await usersCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).send('Error deleting user');
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 }); 
