@@ -259,6 +259,24 @@ app.post('/payments/create-payment-intent', express.json(), async (req, res) => 
   }
 });
 
+// PATCH /appointments/:id/confirm
+// Purpose: Confirm a pending appointment (Admin only in real auth)
+// Access: Admin
+app.patch('/appointments/:id/confirm', async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).send('Invalid ID');
+    const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!appointment) return res.status(404).send('Appointment not found');
+    if (appointment.status !== 'Pending') return res.status(400).send('Cannot confirm');
+    await appointmentsCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status: 'Confirmed' } });
+    const updated = await appointmentsCollection.findOne({ _id: new ObjectId(req.params.id) });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).send('Error confirming appointment');
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 }); 
