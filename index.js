@@ -2,12 +2,14 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config';
 import { MongoClient } from 'mongodb';
+import Stripe from 'stripe';
 
 // ============================================
 // SERVER CONFIGURATION
 // ============================================
 const port = process.env.PORT || 3001;
 const app = express();
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 app.use(cors());
 app.use(express.json());
 
@@ -230,6 +232,30 @@ app.patch('/services/:id/status', express.json(), async (req, res) => {
     res.json(updated);
   } catch (err) {
     res.status(500).send('Error updating status');
+  }
+});
+
+// POST /payments/create-payment-intent
+// Purpose: Create Stripe PaymentIntent for an appointment
+// Access: Customer (auth not enforced in this simple backend)
+app.post('/payments/create-payment-intent', express.json(), async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    const { appointmentId } = req.body;
+    if (!ObjectId.isValid(appointmentId)) return res.status(400).send('Invalid ID');
+    const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
+    if (!appointment) return res.status(404).send('Appointment not found');
+    if (appointment.status !== 'Confirmed') return res.status(400).send('Appointment not confirmed');
+    if (appointment.paymentStatus === 'Paid') return res.status(400).send('Already paid');
+    const amount = Math.round(Number(appointment.price) * 100);
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount,
+      currency: 'usd',
+      metadata: { appointmentId, customerId: appointment.customerId },
+    });
+    res.json({ success: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+  } catch (err) {
+    res.status(500).send('Error creating payment intent');
   }
 });
 
