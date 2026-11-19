@@ -3,11 +3,17 @@ import cors from 'cors';
 import 'dotenv/config';
 import { MongoClient } from 'mongodb';
 
+// ============================================
+// SERVER CONFIGURATION
+// ============================================
 const port = process.env.PORT || 3001;
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ============================================
+// DATABASE CONNECTION
+// ============================================
 const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-bqzlc8s-shard-00-00.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-01.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-02.6my06uv.mongodb.net:27017/?ssl=true&replicaSet=atlas-14p3me-shard-0&authSource=admin`)
 
 export async function connectToMongoDB() {
@@ -26,6 +32,13 @@ const usersCollection = db.collection('user');
 const servicesCollection = db.collection('services');
 const appointmentsCollection = db.collection('appointments');
 
+// ============================================
+// APPOINTMENTS APIs
+// ============================================
+
+// POST /appointments
+// Purpose: Create a new appointment request
+// Access: Customer (verified on frontend/backend as needed)
 app.post('/appointments', express.json(), async (req, res) => {
   try {
     const { customerId, customerName, customerEmail, serviceId, appointmentDate, timeSlot, message } = req.body;
@@ -53,6 +66,9 @@ app.post('/appointments', express.json(), async (req, res) => {
   }
 });
 
+// GET /appointments
+// Purpose: Get all appointments
+// Access: Admin / system use
 app.get('/appointments', async (req, res) => {
   try {
     const appointments = await appointmentsCollection.find().toArray();
@@ -62,30 +78,9 @@ app.get('/appointments', async (req, res) => {
   }
 });
 
-app.get('/users', async (req, res) => {
-  try {
-    const users = await usersCollection.find().toArray();
-    res.json(users);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving users');
-  }
-});
-
-app.get('/services', async (req, res) => {
-  try {
-    const services = await servicesCollection.find().toArray();
-    res.json(services);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving services');
-  }
-});
-
-app.get('/', (req, res) => {
-  res.send('Hello World!');
-});
-
+// PATCH /appointments/:id/cancel
+// Purpose: Cancel a pending appointment
+// Access: Customer (owner) / Admin
 app.patch('/appointments/:id/cancel', async (req, res) => {
   try {
     const { ObjectId } = await import('mongodb');
@@ -97,6 +92,90 @@ app.patch('/appointments/:id/cancel', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).send('Error cancelling appointment');
+  }
+});
+
+// ============================================
+// USERS / ADMIN APIs
+// ============================================
+
+// GET /users
+// Purpose: Get all users
+// Access: Admin
+app.get('/users', async (req, res) => {
+  try {
+    const users = await usersCollection.find().toArray();
+    res.json(users);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error retrieving users');
+  }
+});
+
+// ============================================
+// SERVICES APIs
+// ============================================
+
+// GET /services
+// Purpose: Get all salon services
+// Access: Public
+app.get('/services', async (req, res) => {
+  try {
+    const services = await servicesCollection.find().toArray();
+    res.json(services);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Error retrieving services');
+  }
+});
+
+// POST /services
+// Purpose: Create a new salon service
+// Access: Admin only
+app.post('/services', express.json(), async (req, res) => {
+  try {
+    const { serviceName, category, description, price, duration, image, status } = req.body;
+    const doc = {
+      serviceName, category, description,
+      price: Number(price), duration: Number(duration),
+      image, status: status || 'active',
+      createdAt: new Date().toISOString(),
+    };
+    await servicesCollection.insertOne(doc);
+    res.json(doc);
+  } catch (err) {
+    res.status(500).send('Error creating service');
+  }
+});
+
+// ============================================
+// GENERAL / HEALTH APIs
+// ============================================
+
+// GET /
+// Purpose: Basic health check
+// Access: Public
+app.get('/', (req, res) => {
+  res.send('Hello World!');
+});
+
+app.delete('/services/:id', async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    await servicesCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).send('Error deleting service');
+  }
+});
+
+app.patch('/services/:id', express.json(), async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    await servicesCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).send('Error updating service');
   }
 });
 
