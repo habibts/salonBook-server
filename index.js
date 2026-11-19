@@ -200,6 +200,39 @@ app.delete('/users/:id', async (req, res) => {
   }
 });
 
+// GET /services/:id
+// Purpose: Get a single service by MongoDB ID
+// Access: Public
+app.get('/services/:id', async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).send('Invalid ID');
+    const service = await servicesCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!service) return res.status(404).send('Service not found');
+    res.json(service);
+  } catch (err) {
+    res.status(500).send('Error retrieving service');
+  }
+});
+
+// PATCH /services/:id/status
+// Purpose: Update service status (Active/Inactive)
+// Access: Admin only (frontend/backend authorization as existing)
+app.patch('/services/:id/status', express.json(), async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).send('Invalid ID');
+    const { status } = req.body;
+    if (!['active','inactive'].includes(status)) return res.status(400).send('Invalid status');
+    const result = await servicesCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status } });
+    if (result.matchedCount === 0) return res.status(404).send('Service not found');
+    const updated = await servicesCollection.findOne({ _id: new ObjectId(req.params.id) });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).send('Error updating status');
+  }
+});
+
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 }); 
