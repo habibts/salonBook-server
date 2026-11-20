@@ -33,6 +33,7 @@ const db = connectedClient.db('salonBook');
 const usersCollection = db.collection('user');
 const servicesCollection = db.collection('services');
 const appointmentsCollection = db.collection('appointments');
+const transactionsCollection = db.collection('transactions');
 
 // ============================================
 // APPOINTMENTS APIs
@@ -275,6 +276,55 @@ app.patch('/appointments/:id/confirm', async (req, res) => {
   } catch (err) {
     res.status(500).send('Error confirming appointment');
   }
+});
+
+// POST /payments/webhook
+// Purpose: Handle Stripe webhook events
+// Access: Stripe (signature verified)
+app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send('Webhook signature verification failed');
+  }
+
+  if (event.type === 'payment_intent.succeeded') {
+    const paymentIntent = event.data.object;
+    const appointmentId = paymentIntent.metadata?.appointmentId;
+    if (appointmentId) {
+      const { ObjectId } = await import('mongodb');
+      const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
+      if (appointment) {
+        const expectedAmount = Math.round(Number(appointment.price) * 100);
+        if (expectedAmount === paymentIntent.amount) {
+          await appointmentsCollection.updateOne(
+            { _id: new ObjectId(appointmentId) },
+            { $set: { paymentStatus: 'Paid', updatedAt: new Date().toISOString() } }
+          );
+          const existing = await transactionsCollection.findOne({ paymentIntentId: paymentIntent.id });
+          if (!existing) {
+            await transactionsCollection.insertOne({
+              appointmentId,
+              customerId: appointment.customerId,
+              paymentIntentId: paymentIntent.id,
+              amount: paymentIntent.amount,
+              currency: paymentIntent.currency,
+              status: 'Paid',
+              createdAt: new Date().toISOString(),
+            });
+          }
+        }
+      }
+    }
+  }
+
+  if (event.type === 'payment_intent.payment_failed') {
+    // Do not mark as paid
+  }
+
+  res.json({ received: true });
 });
 
 app.listen(port, () => {
