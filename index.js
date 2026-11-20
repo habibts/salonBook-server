@@ -11,7 +11,6 @@ const port = process.env.PORT || 3001;
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 app.use(cors());
-app.use(express.json());
 
 // ============================================
 // DATABASE CONNECTION
@@ -290,19 +289,25 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
     return res.status(400).send('Webhook signature verification failed');
   }
 
+  console.log('Webhook received:', event.type);
   if (event.type === 'payment_intent.succeeded') {
     const paymentIntent = event.data.object;
+    console.log('PaymentIntent ID:', paymentIntent.id);
     const appointmentId = paymentIntent.metadata?.appointmentId;
+    console.log('Appointment ID from metadata:', appointmentId);
     if (appointmentId) {
       const { ObjectId } = await import('mongodb');
       const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
+      console.log('Appointment found:', !!appointment);
       if (appointment) {
         const expectedAmount = Math.round(Number(appointment.price) * 100);
+        console.log('Expected:', expectedAmount, 'Actual:', paymentIntent.amount);
         if (expectedAmount === paymentIntent.amount) {
-          await appointmentsCollection.updateOne(
+          const updateResult = await appointmentsCollection.updateOne(
             { _id: new ObjectId(appointmentId) },
             { $set: { paymentStatus: 'Paid', updatedAt: new Date().toISOString() } }
           );
+          console.log('Update matched:', updateResult.matchedCount, 'modified:', updateResult.modifiedCount);
           const existing = await transactionsCollection.findOne({ paymentIntentId: paymentIntent.id });
           if (!existing) {
             await transactionsCollection.insertOne({
@@ -314,6 +319,9 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
               status: 'Paid',
               createdAt: new Date().toISOString(),
             });
+            console.log('Transaction created');
+          } else {
+            console.log('Transaction already exists');
           }
         }
       }
