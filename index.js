@@ -142,7 +142,7 @@ async function getUserFromDatabase(userId) {
   }
 }
 
-function verifyJWT(req, res, next) {
+async function verifyJWT(req, res, next) {
   const token = readToken(req);
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
 
@@ -154,36 +154,35 @@ function verifyJWT(req, res, next) {
   }
 
   // Check token revocation
-  if (payload.jti && isTokenRevoked(payload.jti)) {
+  if (payload.jti && await isTokenRevoked(payload.jti)) {
     return res.status(401).json({ error: 'Token revoked' });
   }
 
   // Fetch current user from database
-  getUserFromDatabase(payload.sub)
-    .then((user) => {
-      if (!user) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
+  try {
+    const user = await getUserFromDatabase(payload.userId);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
 
-      // Check account status
-      const status = user.status || 'active';
-      if (status === 'blocked' || status === 'deleted' || status === 'deactivated') {
-        return res.status(403).json({ error: 'Account inactive' });
-      }
+    // Check account status
+    const status = user.status || 'active';
+    if (status === 'blocked' || status === 'deleted' || status === 'deactivated') {
+      return res.status(403).json({ error: 'Account inactive' });
+    }
 
-      // Attach trusted database user to request
-      req.user = {
-        id: user._id.toString(),
-        email: user.email,
-        name: user.name,
-        role: user.role || 'customer',
-        status: user.status || 'active',
-      };
-      next();
-    })
-    .catch(() => {
-      res.status(401).json({ error: 'Unauthorized' });
-    });
+    // Attach trusted database user to request
+    req.user = {
+      id: user._id.toString(),
+      email: user.email,
+      name: user.name,
+      role: user.role || 'customer',
+      status: user.status || 'active',
+    };
+    next();
+  } catch {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
 }
 
 function verifyAdmin(req, res, next) {
