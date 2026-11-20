@@ -3,6 +3,7 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import multer from 'multer';
 import 'dotenv/config';
 import { MongoClient, ObjectId } from 'mongodb';
 import Stripe from 'stripe';
@@ -25,6 +26,33 @@ const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 const AUTH_COOKIE = 'salon_token';
 const AUTH_COOKIE_ALT = 'salonbook_jwt';
 const BETTER_AUTH_URL = (process.env.BETTER_AUTH_URL || 'http://localhost:3000').replace(/\/+$/, '');
+
+// ============================================
+// IMGBB CONFIGURATION
+// ============================================
+const IMGBB_API_KEY = process.env.IMGBB_API_KEY;
+
+const IMGBB_MAX_SIZE = 5 * 1024 * 1024; // 5 MB
+const IMGBB_ALLOWED_MIME = new Set([
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+]);
+
+const IMGBB_ALLOWED_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: IMGBB_MAX_SIZE },
+  fileFilter: (req, file, cb) => {
+    const ext = file.originalname.toLowerCase().slice(file.originalname.lastIndexOf('.'));
+    if (!IMGBB_ALLOWED_EXT.has(ext) || !IMGBB_ALLOWED_MIME.has(file.mimetype)) {
+      return cb(new Error('Invalid file type. Only JPG, JPEG, PNG and WEBP images are allowed.'));
+    }
+    cb(null, true);
+  },
+});
 
 const cookieOptions = {
   httpOnly: true,
@@ -365,6 +393,60 @@ app.post('/services', express.json(), verifyJWT, verifyAdmin, async (req, res) =
   } catch (err) {
     res.status(500).send('Error creating service');
   }
+});
+
+// POST /services/upload-image
+// Purpose: Upload an image to ImgBB and return the direct image URL
+// Access: Admin only
+app.post('/services/upload-image', verifyJWT, verifyAdmin, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image file provided.' });
+    }
+
+    if (!IMGBB_API_KEY) {
+      return res.status(500).json({ error: 'Image upload service is not configured.' });
+    }
+
+    const formData = new FormData();
+    formData.append('key', IMGBB_API_KEY);
+    formData.append('image', req.file.buffer.toString('base64'));
+
+    const imgbbRes = await fetch('https://api.imgbb.com/1/upload', {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!imgbbRes.ok) {
+      const errText = await imgbbRes.text().catch(() => 'Unknown ImgBB error');
+      return res.status(502).json({ error: `ImgBB upload failed: ${errText}` });
+    }
+
+    const imgbbData = await imgbbRes.json();
+
+    if (!imgbbData.success || !imgbbData.data?.url) {
+      return res.status(502).json({ error: 'ImgBB did not return a valid image URL.' });
+    }
+
+    res.json({ url: imgbbData.data.url });
+  } catch (err) {
+    console.error('Image upload error:', err);
+    res.status(500).json({ error: 'Image upload failed.' });
+  }
+});
+
+// Error handler for multer upload errors (file type, size limits)
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File too large. Maximum size is 5 MB.' });
+    }
+    return res.status(400).json({ error: err.message });
+  }
+  if (err.message && err.message.includes('Invalid file type')) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
 });
 
 // ============================================
