@@ -1,7 +1,10 @@
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
+import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import 'dotenv/config';
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import Stripe from 'stripe';
 
 // ============================================
@@ -10,17 +13,44 @@ import Stripe from 'stripe';
 const port = process.env.PORT || 3001;
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-app.use(cors());
+
+// ============================================
+// JWT / AUTH CONFIGURATION
+// ============================================
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET is required: set it in the backend .env file.');
+}
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+const AUTH_COOKIE = 'salon_token';
+const AUTH_COOKIE_ALT = 'salonbook_jwt';
+const BETTER_AUTH_URL = (process.env.BETTER_AUTH_URL || 'http://localhost:3000').replace(/\/+$/, '');
+
+const cookieOptions = {
+  httpOnly: true,
+  sameSite: 'lax',
+  secure: process.env.NODE_ENV === 'production',
+  path: '/',
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+};
+
+const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:3000')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(cookieParser());
 
 // ============================================
 // DATABASE CONNECTION
 // ============================================
-const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-bqzlc8s-shard-00-00.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-01.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-02.6my06uv.mongodb.net:27017/?ssl=true&replicaSet=atlas-14p3me-shard-0&authSource=admin`)
+const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-bqzlc8s-shard-00-00.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-01.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-02.6my06uv.mongodb.net:27017/?ssl=true&replicaSet=atlas-14p3me-shard-0&authSource=admin`);
 
 export async function connectToMongoDB() {
   try {
     await client.connect();
-    console.log("You successfully connected to MongoDB!");
+    console.log('You successfully connected to MongoDB!');
     return client;
   } catch (err) {
     console.dir(err);
@@ -33,6 +63,195 @@ const usersCollection = db.collection('user');
 const servicesCollection = db.collection('services');
 const appointmentsCollection = db.collection('appointments');
 const transactionsCollection = db.collection('transactions');
+const revokedTokensCollection = db.collection('revoked_tokens');
+
+// Create TTL index for revoked tokens (expire after JWT_EXPIRES_IN)
+await revokedTokensCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+// ============================================
+// AUTH HELPERS / MIDDLEWARE
+// ============================================
+
+// Ask Better Auth (Next.js app) who owns the session cookie. The cookie is
+// forwarded as-is; Better Auth validates its own signature and returns the
+// session or null, so no session data is trusted from the client.
+async function getBetterAuthSession(req) {
+  if (!req.headers.cookie) return null;
+
+  const response = await fetch(`${BETTER_AUTH_URL}/api/auth/get-session`, {
+    headers: { cookie: req.headers.cookie },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!response.ok) return null;
+
+  const session = await response.json();
+  return session && session.user ? session : null;
+}
+
+function generateJti() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function signUserToken(user) {
+  const jti = generateJti();
+  return jwt.sign(
+    {
+      sub: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role || 'customer',
+      jti,
+    },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
+}
+
+function readToken(req) {
+  // Check Express cookie first
+  if (req.cookies?.[AUTH_COOKIE]) return req.cookies[AUTH_COOKIE];
+  // Fallback to Next.js cookie name (for cross-origin scenarios where cookie is shared)
+  if (req.cookies?.[AUTH_COOKIE_ALT]) return req.cookies[AUTH_COOKIE_ALT];
+  // Check Authorization header
+  const header = req.headers.authorization;
+  if (header && header.startsWith('Bearer ')) return header.slice(7);
+  return null;
+}
+
+async function isTokenRevoked(jti) {
+  if (!jti) return false;
+  const revoked = await revokedTokensCollection.findOne({ jti });
+  return !!revoked;
+}
+
+async function revokeToken(jti, expiresAt) {
+  if (!jti) return;
+  await revokedTokensCollection.updateOne(
+    { jti },
+    { $set: { jti, revokedAt: new Date(), expiresAt } },
+    { upsert: true }
+  );
+}
+
+async function getUserFromDatabase(userId) {
+  try {
+    const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+    return user;
+  } catch {
+    return null;
+  }
+}
+
+function verifyJWT(req, res, next) {
+  const token = readToken(req);
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+  let payload;
+  try {
+    payload = jwt.verify(token, JWT_SECRET);
+  } catch {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Check token revocation
+  if (payload.jti && isTokenRevoked(payload.jti)) {
+    return res.status(401).json({ error: 'Token revoked' });
+  }
+
+  // Fetch current user from database
+  getUserFromDatabase(payload.sub)
+    .then((user) => {
+      if (!user) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+
+      // Check account status
+      const status = user.status || 'active';
+      if (status === 'blocked' || status === 'deleted' || status === 'deactivated') {
+        return res.status(403).json({ error: 'Account inactive' });
+      }
+
+      // Attach trusted database user to request
+      req.user = {
+        id: user._id.toString(),
+        email: user.email,
+        name: user.name,
+        role: user.role || 'customer',
+        status: user.status || 'active',
+      };
+      next();
+    })
+    .catch(() => {
+      res.status(401).json({ error: 'Unauthorized' });
+    });
+}
+
+function verifyAdmin(req, res, next) {
+  // req.user is already populated by verifyJWT with trusted database data
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  // Double-check status (verifyJWT already checked, but defense in depth)
+  if (req.user?.status === 'blocked' || req.user?.status === 'deleted' || req.user?.status === 'deactivated') {
+    return res.status(403).json({ error: 'Account inactive' });
+  }
+
+  next();
+}
+
+// POST /auth/token
+// Purpose: Exchange a valid Better Auth session for an HTTP-only JWT cookie
+// Access: Signed-in user (Better Auth session required)
+app.post('/auth/token', async (req, res) => {
+  try {
+    const session = await getBetterAuthSession(req);
+    if (!session) return res.status(401).json({ error: 'No Better Auth session' });
+
+    const { user } = session;
+    const token = signUserToken(user);
+    res.cookie(AUTH_COOKIE, token, cookieOptions);
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role || 'customer',
+      },
+    });
+  } catch (err) {
+    console.error('Error issuing JWT:', err);
+    res.status(500).json({ error: 'Error issuing token' });
+  }
+});
+
+// POST /auth/logout
+// Purpose: Clear the backend JWT cookie and revoke the token
+// Access: Public (idempotent)
+app.post('/auth/logout', (req, res) => {
+  const token = readToken(req);
+  if (token) {
+    try {
+      const payload = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true });
+      if (payload.jti) {
+        // Calculate expiry from exp claim (seconds since epoch)
+        const expiresAt = payload.exp ? new Date(payload.exp * 1000) : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        revokeToken(payload.jti, expiresAt);
+      }
+    } catch {
+      // Ignore verification errors on logout
+    }
+  }
+  res.clearCookie(AUTH_COOKIE, cookieOptions);
+  res.json({ success: true });
+});
+
+// GET /auth/me
+// Purpose: Return the JWT payload for the current request
+// Access: Signed-in user
+app.get('/auth/me', verifyJWT, (req, res) => {
+  res.json({ user: req.user });
+});
 
 // ============================================
 // APPOINTMENTS APIs
@@ -41,10 +260,10 @@ const transactionsCollection = db.collection('transactions');
 // POST /appointments
 // Purpose: Create a new appointment request
 // Access: Customer (verified on frontend/backend as needed)
-app.post('/appointments', express.json(), async (req, res) => {
+app.post('/appointments', express.json(), verifyJWT, async (req, res) => {
   try {
     const { customerId, customerName, customerEmail, serviceId, appointmentDate, timeSlot, message } = req.body;
-    const service = await servicesCollection.findOne({ _id: new (await import('mongodb')).ObjectId(serviceId) });
+    const service = await servicesCollection.findOne({ _id: new ObjectId(serviceId) });
     if (!service || service.status !== 'active') return res.status(400).send('Invalid service');
     const exists = await appointmentsCollection.findOne({ serviceId, appointmentDate, timeSlot, status: { $ne: 'cancelled' } });
     if (exists) return res.status(409).send('Slot unavailable');
@@ -71,7 +290,7 @@ app.post('/appointments', express.json(), async (req, res) => {
 // GET /appointments
 // Purpose: Get all appointments
 // Access: Admin / system use
-app.get('/appointments', async (req, res) => {
+app.get('/appointments', verifyJWT, async (req, res) => {
   try {
     const appointments = await appointmentsCollection.find().toArray();
     res.json(appointments);
@@ -83,9 +302,8 @@ app.get('/appointments', async (req, res) => {
 // PATCH /appointments/:id/cancel
 // Purpose: Cancel a pending appointment
 // Access: Customer (owner) / Admin
-app.patch('/appointments/:id/cancel', async (req, res) => {
+app.patch('/appointments/:id/cancel', verifyJWT, async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
     const result = await appointmentsCollection.updateOne(
       { _id: new ObjectId(req.params.id), status: 'Pending' },
       { $set: { status: 'Cancelled', updatedAt: new Date().toISOString() } }
@@ -104,7 +322,7 @@ app.patch('/appointments/:id/cancel', async (req, res) => {
 // GET /users
 // Purpose: Get all users
 // Access: Admin
-app.get('/users', async (req, res) => {
+app.get('/users', verifyJWT, verifyAdmin, async (req, res) => {
   try {
     const users = await usersCollection.find().toArray();
     res.json(users);
@@ -134,7 +352,7 @@ app.get('/services', async (req, res) => {
 // POST /services
 // Purpose: Create a new salon service
 // Access: Admin only
-app.post('/services', express.json(), async (req, res) => {
+app.post('/services', express.json(), verifyJWT, verifyAdmin, async (req, res) => {
   try {
     const { serviceName, category, description, price, duration, image, status } = req.body;
     const doc = {
@@ -161,9 +379,8 @@ app.get('/', (req, res) => {
   res.send('Hello World!');
 });
 
-app.delete('/services/:id', async (req, res) => {
+app.delete('/services/:id', verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
     await servicesCollection.deleteOne({ _id: new ObjectId(req.params.id) });
     res.json({ success: true });
   } catch (err) {
@@ -171,9 +388,8 @@ app.delete('/services/:id', async (req, res) => {
   }
 });
 
-app.patch('/services/:id', express.json(), async (req, res) => {
+app.patch('/services/:id', express.json(), verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
     await servicesCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: req.body });
     res.json({ success: true });
   } catch (err) {
@@ -181,9 +397,8 @@ app.patch('/services/:id', express.json(), async (req, res) => {
   }
 });
 
-app.patch('/users/:id/status', express.json(), async (req, res) => {
+app.patch('/users/:id/status', express.json(), verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
     const { status } = req.body;
     await usersCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status } });
     res.json({ success: true });
@@ -192,9 +407,8 @@ app.patch('/users/:id/status', express.json(), async (req, res) => {
   }
 });
 
-app.delete('/users/:id', async (req, res) => {
+app.delete('/users/:id', verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
     await usersCollection.deleteOne({ _id: new ObjectId(req.params.id) });
     res.json({ success: true });
   } catch (err) {
@@ -205,9 +419,22 @@ app.delete('/users/:id', async (req, res) => {
 // GET /services/:id
 // Purpose: Get a single service by MongoDB ID
 // Access: Public
-app.get('/transactions/:id/details', async (req, res) => {
+app.get('/services/:id', async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
+    if (!ObjectId.isValid(req.params.id)) return res.status(400).send('Invalid ID');
+    const service = await servicesCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!service) return res.status(404).send('Service not found');
+    res.json(service);
+  } catch (err) {
+    res.status(500).send('Error retrieving service');
+  }
+});
+
+// GET /transactions/:id/details
+// Purpose: Get transaction details with appointment and service
+// Access: Admin
+app.get('/transactions/:id/details', verifyJWT, verifyAdmin, async (req, res) => {
+  try {
     const t = await transactionsCollection.findOne({ _id: new ObjectId(req.params.id) });
     if (!t) return res.status(404).json({ error: 'Not found' });
     const appt = await appointmentsCollection.findOne({ _id: new ObjectId(t.appointmentId) });
@@ -219,7 +446,10 @@ app.get('/transactions/:id/details', async (req, res) => {
   }
 });
 
-app.get('/transactions', async (req, res) => {
+// GET /transactions
+// Purpose: Get all transactions
+// Access: Admin (verifyJWT + verifyAdmin)
+app.get('/transactions', verifyJWT, verifyAdmin, async (req, res) => {
   try {
     const transactions = await transactionsCollection.find({}).sort({ createdAt: -1 }).toArray();
     res.json(transactions);
@@ -228,27 +458,14 @@ app.get('/transactions', async (req, res) => {
   }
 });
 
-app.get('/services/:id', async (req, res) => {
-  try {
-    const { ObjectId } = await import('mongodb');
-    if (!ObjectId.isValid(req.params.id)) return res.status(400).send('Invalid ID');
-    const service = await servicesCollection.findOne({ _id: new ObjectId(req.params.id) });
-    if (!service) return res.status(404).send('Service not found');
-    res.json(service);
-  } catch (err) {
-    res.status(500).send('Error retrieving service');
-  }
-});
-
 // PATCH /services/:id/status
 // Purpose: Update service status (Active/Inactive)
-// Access: Admin only (frontend/backend authorization as existing)
-app.patch('/services/:id/status', express.json(), async (req, res) => {
+// Access: Admin only
+app.patch('/services/:id/status', express.json(), verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
     if (!ObjectId.isValid(req.params.id)) return res.status(400).send('Invalid ID');
     const { status } = req.body;
-    if (!['active','inactive'].includes(status)) return res.status(400).send('Invalid status');
+    if (!['active', 'inactive'].includes(status)) return res.status(400).send('Invalid status');
     const result = await servicesCollection.updateOne({ _id: new ObjectId(req.params.id) }, { $set: { status } });
     if (result.matchedCount === 0) return res.status(404).send('Service not found');
     const updated = await servicesCollection.findOne({ _id: new ObjectId(req.params.id) });
@@ -260,10 +477,9 @@ app.patch('/services/:id/status', express.json(), async (req, res) => {
 
 // POST /payments/create-payment-intent
 // Purpose: Create Stripe PaymentIntent for an appointment
-// Access: Customer (auth not enforced in this simple backend)
-app.post('/payments/create-payment-intent', express.json(), async (req, res) => {
+// Access: Customer (auth enforced via verifyJWT)
+app.post('/payments/create-payment-intent', express.json(), verifyJWT, async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
     const { appointmentId } = req.body;
     if (!ObjectId.isValid(appointmentId)) return res.status(400).send('Invalid ID');
     const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
@@ -283,11 +499,10 @@ app.post('/payments/create-payment-intent', express.json(), async (req, res) => 
 });
 
 // PATCH /appointments/:id/confirm
-// Purpose: Confirm a pending appointment (Admin only in real auth)
+// Purpose: Confirm a pending appointment (Admin only)
 // Access: Admin
-app.patch('/appointments/:id/confirm', async (req, res) => {
+app.patch('/appointments/:id/confirm', verifyJWT, verifyAdmin, async (req, res) => {
   try {
-    const { ObjectId } = await import('mongodb');
     if (!ObjectId.isValid(req.params.id)) return res.status(400).send('Invalid ID');
     const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(req.params.id) });
     if (!appointment) return res.status(404).send('Appointment not found');
@@ -319,7 +534,6 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
     const appointmentId = paymentIntent.metadata?.appointmentId;
     console.log('Appointment ID from metadata:', appointmentId);
     if (appointmentId) {
-      const { ObjectId } = await import('mongodb');
       const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
       console.log('Appointment found:', !!appointment);
       if (appointment) {
@@ -360,4 +574,4 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
-}); 
+});
