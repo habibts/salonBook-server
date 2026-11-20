@@ -205,6 +205,29 @@ app.delete('/users/:id', async (req, res) => {
 // GET /services/:id
 // Purpose: Get a single service by MongoDB ID
 // Access: Public
+app.get('/transactions/:id/details', async (req, res) => {
+  try {
+    const { ObjectId } = await import('mongodb');
+    const t = await transactionsCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!t) return res.status(404).json({ error: 'Not found' });
+    const appt = await appointmentsCollection.findOne({ _id: new ObjectId(t.appointmentId) });
+    let service = null;
+    if (appt?.serviceId) service = await servicesCollection.findOne({ _id: new ObjectId(appt.serviceId) });
+    res.json({ transaction: t, appointment: appt, service });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/transactions', async (req, res) => {
+  try {
+    const transactions = await transactionsCollection.find({}).sort({ createdAt: -1 }).toArray();
+    res.json(transactions);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/services/:id', async (req, res) => {
   try {
     const { ObjectId } = await import('mongodb');
