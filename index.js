@@ -297,6 +297,78 @@ app.get('/auth/me', verifyJWT, (req, res) => {
   res.json({ user: req.user });
 });
 
+// PUT /user/profile
+// Purpose: Update current user's profile (name, phone)
+// Access: Signed-in user
+app.put('/user/profile', express.json(), verifyJWT, async (req, res) => {
+  try {
+    const { name, phone } = req.body;
+    const updateDoc = {};
+    if (name && name.trim()) updateDoc.name = name.trim();
+    if (phone !== undefined) updateDoc.phone = phone.trim ? phone.trim() : phone;
+    
+    if (Object.keys(updateDoc).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+    
+    updateDoc.updatedAt = new Date().toISOString();
+    
+    await usersCollection.updateOne(
+      { _id: new ObjectId(req.user.id) },
+      { $set: updateDoc }
+    );
+    
+    const updated = await usersCollection.findOne({ _id: new ObjectId(req.user.id) });
+    res.json({ 
+      user: {
+        id: updated._id.toString(),
+        email: updated.email,
+        name: updated.name,
+        phone: updated.phone || '',
+        role: updated.role || 'customer',
+        image: updated.image || '',
+        createdAt: updated.createdAt
+      }
+    });
+  } catch (err) {
+    console.error('Profile update error:', err);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// PUT /user/profile/image
+// Purpose: Update current user's profile image
+// Access: Signed-in user
+app.put('/user/profile/image', express.json(), verifyJWT, async (req, res) => {
+  try {
+    const { image } = req.body;
+    if (!image) {
+      return res.status(400).json({ error: 'Image URL is required' });
+    }
+    
+    await usersCollection.updateOne(
+      { _id: new ObjectId(req.user.id) },
+      { $set: { image, updatedAt: new Date().toISOString() } }
+    );
+    
+    const updated = await usersCollection.findOne({ _id: new ObjectId(req.user.id) });
+    res.json({ 
+      user: {
+        id: updated._id.toString(),
+        email: updated.email,
+        name: updated.name,
+        phone: updated.phone || '',
+        role: updated.role || 'customer',
+        image: updated.image || '',
+        createdAt: updated.createdAt
+      }
+    });
+  } catch (err) {
+    console.error('Profile image update error:', err);
+    res.status(500).json({ error: 'Failed to update profile image' });
+  }
+});
+
 // ============================================
 // APPOINTMENTS APIs
 // ============================================
