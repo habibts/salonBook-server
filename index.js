@@ -573,6 +573,35 @@ app.patch('/services/:id/status', express.json(), verifyJWT, verifyAdmin, async 
   }
 });
 
+// Marks an appointment as Paid and records its transaction — exactly once.
+// Shared by the webhook, checkout and the verification endpoint so every path
+// writes the same documents. Returns false when the charged amount does not
+// match what we asked for (never mark a mismatched charge as paid).
+async function markAppointmentPaid(appointment, paymentIntent) {
+  const expectedAmount = Math.round(Number(appointment.price) * 100);
+  if (expectedAmount !== paymentIntent.amount) return false;
+
+  await appointmentsCollection.updateOne(
+    { _id: appointment._id, paymentStatus: { $ne: 'Paid' } },
+    { $set: { paymentStatus: 'Paid', updatedAt: new Date().toISOString() } }
+  );
+
+  const existing = await transactionsCollection.findOne({ paymentIntentId: paymentIntent.id });
+  if (!existing) {
+    await transactionsCollection.insertOne({
+      appointmentId: String(appointment._id),
+      customerId: appointment.customerId,
+      paymentIntentId: paymentIntent.id,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency,
+      status: 'Paid',
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  return true;
+}
+
 // POST /payments/create-payment-intent
 // Purpose: Create Stripe PaymentIntent for an appointment
 // Access: Customer (auth enforced via verifyJWT)
@@ -585,14 +614,95 @@ app.post('/payments/create-payment-intent', express.json(), verifyJWT, async (re
     if (appointment.status !== 'Confirmed') return res.status(400).send('Appointment not confirmed');
     if (appointment.paymentStatus === 'Paid') return res.status(400).send('Already paid');
     const amount = Math.round(Number(appointment.price) * 100);
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount,
-      currency: 'usd',
-      metadata: { appointmentId, customerId: appointment.customerId },
-    });
+
+    // Reuse the unfinished intent already stored on this appointment so a
+    // retry does not pile up PaymentIntents, and settle straight away when a
+    // previous attempt already succeeded but the webhook never arrived.
+    let paymentIntent = null;
+    if (appointment.paymentIntentId) {
+      try {
+        const existing = await stripe.paymentIntents.retrieve(appointment.paymentIntentId);
+        if (existing?.status === 'succeeded') {
+          await markAppointmentPaid(appointment, existing);
+          return res.status(409).send('Already paid');
+        }
+        if (
+          existing &&
+          existing.amount === amount &&
+          ['requires_payment_method', 'requires_confirmation', 'requires_action'].includes(existing.status)
+        ) {
+          paymentIntent = existing;
+        }
+      } catch {
+        // Intent is gone or unusable — a fresh one is created below.
+      }
+    }
+
+    if (!paymentIntent) {
+      paymentIntent = await stripe.paymentIntents.create({
+        amount,
+        currency: 'usd',
+        metadata: { appointmentId, customerId: appointment.customerId },
+      });
+      await appointmentsCollection.updateOne(
+        { _id: new ObjectId(appointmentId) },
+        { $set: { paymentIntentId: paymentIntent.id, updatedAt: new Date().toISOString() } }
+      );
+    }
+
     res.json({ success: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
   } catch (err) {
     res.status(500).send('Error creating payment intent');
+  }
+});
+
+// POST /payments/verify
+// Purpose: Ask Stripe directly whether an appointment's payment succeeded and
+//          settle the record. The webhook stays the primary path; this is the
+//          idempotent fallback for local development or webhook downtime.
+// Access: Customer (the appointment owner) / Admin
+app.post('/payments/verify', express.json(), verifyJWT, async (req, res) => {
+  try {
+    const { appointmentId, paymentIntentId } = req.body;
+    if (!ObjectId.isValid(appointmentId)) return res.status(400).json({ error: 'Invalid ID' });
+
+    const appointment = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
+    if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+
+    const isOwner = appointment.customerId === req.user.id;
+    if (!isOwner && req.user.role !== 'admin') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    if (appointment.paymentStatus === 'Paid') {
+      return res.json({ paid: true, appointment });
+    }
+
+    // Prefer the intent the browser just paid, then the one stored at checkout.
+    const intentId = paymentIntentId || appointment.paymentIntentId;
+    if (!intentId) return res.json({ paid: false, appointment });
+
+    let paymentIntent;
+    try {
+      paymentIntent = await stripe.paymentIntents.retrieve(intentId);
+    } catch {
+      return res.json({ paid: false, appointment });
+    }
+
+    if (paymentIntent.metadata?.appointmentId !== appointmentId) {
+      return res.json({ paid: false, appointment });
+    }
+    if (paymentIntent.status !== 'succeeded') {
+      return res.json({ paid: false, appointment });
+    }
+
+    await markAppointmentPaid(appointment, paymentIntent);
+
+    const updated = await appointmentsCollection.findOne({ _id: new ObjectId(appointmentId) });
+    res.json({ paid: updated.paymentStatus === 'Paid', appointment: updated });
+  } catch (err) {
+    console.error('Error verifying payment:', err);
+    res.status(500).json({ error: 'Error verifying payment' });
   }
 });
 
@@ -637,28 +747,8 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
       if (appointment) {
         const expectedAmount = Math.round(Number(appointment.price) * 100);
         console.log('Expected:', expectedAmount, 'Actual:', paymentIntent.amount);
-        if (expectedAmount === paymentIntent.amount) {
-          const updateResult = await appointmentsCollection.updateOne(
-            { _id: new ObjectId(appointmentId) },
-            { $set: { paymentStatus: 'Paid', updatedAt: new Date().toISOString() } }
-          );
-          console.log('Update matched:', updateResult.matchedCount, 'modified:', updateResult.modifiedCount);
-          const existing = await transactionsCollection.findOne({ paymentIntentId: paymentIntent.id });
-          if (!existing) {
-            await transactionsCollection.insertOne({
-              appointmentId,
-              customerId: appointment.customerId,
-              paymentIntentId: paymentIntent.id,
-              amount: paymentIntent.amount,
-              currency: paymentIntent.currency,
-              status: 'Paid',
-              createdAt: new Date().toISOString(),
-            });
-            console.log('Transaction created');
-          } else {
-            console.log('Transaction already exists');
-          }
-        }
+        const paid = await markAppointmentPaid(appointment, paymentIntent);
+        console.log('Appointment settled:', paid);
       }
     }
   }
