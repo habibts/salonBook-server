@@ -656,3 +656,5 @@ app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
+
+export default app;
