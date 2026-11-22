@@ -5,8 +5,9 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import multer from 'multer';
 import 'dotenv/config';
-import { MongoClient, ObjectId } from 'mongodb';
+import { ObjectId } from 'mongodb';
 import Stripe from 'stripe';
+import { getDb, closeMongoClient } from './lib/mongodb.js';
 
 // ============================================
 // SERVER CONFIGURATION
@@ -73,28 +74,44 @@ app.use(cookieParser());
 // ============================================
 // DATABASE CONNECTION
 // ============================================
-const client = new MongoClient(`mongodb://${process.env.DB_USER}:${process.env.DB_PASSWORD}@ac-bqzlc8s-shard-00-00.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-01.6my06uv.mongodb.net:27017,ac-bqzlc8s-shard-00-02.6my06uv.mongodb.net:27017/?ssl=true&replicaSet=atlas-14p3me-shard-0&authSource=admin`);
 
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log('You successfully connected to MongoDB!');
-    return client;
-  } catch (err) {
-    console.dir(err);
-  }
+// Database collections (initialized after DB connection)
+let usersCollection;
+let servicesCollection;
+let appointmentsCollection;
+let transactionsCollection;
+let revokedTokensCollection;
+
+export async function initializeDb() {
+  const db = await getDb();
+  usersCollection = db.collection('user');
+  servicesCollection = db.collection('services');
+  appointmentsCollection = db.collection('appointments');
+  transactionsCollection = db.collection('transactions');
+  revokedTokensCollection = db.collection('revoked_tokens');
+
+  // Create TTL index for revoked tokens (expire after JWT_EXPIRES_IN)
+  await revokedTokensCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+  console.log('Database initialized successfully');
+  return db;
 }
 
-const connectedClient = await connectToMongoDB();
-const db = connectedClient.db('salonBook');
-const usersCollection = db.collection('user');
-const servicesCollection = db.collection('services');
-const appointmentsCollection = db.collection('appointments');
-const transactionsCollection = db.collection('transactions');
-const revokedTokensCollection = db.collection('revoked_tokens');
+// Initialize DB on startup
+await initializeDb();
 
-// Create TTL index for revoked tokens (expire after JWT_EXPIRES_IN)
-await revokedTokensCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+// Handle graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, closing MongoDB connection...');
+  await closeMongoClient();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, closing MongoDB connection...');
+  await closeMongoClient();
+  process.exit(0);
+});
 
 // ============================================
 // AUTH HELPERS / MIDDLEWARE
